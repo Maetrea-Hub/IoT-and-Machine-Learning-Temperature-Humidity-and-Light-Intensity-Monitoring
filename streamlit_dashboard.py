@@ -29,6 +29,7 @@ from queue import Queue, Empty
 import os
 import ssl
 
+# ------------------------ Configuration (fill these or use env vars) ------------------------
 MQTT_BROKER = os.environ.get("HIVEMQ_HOST", "ac2c24cb9a454ce58c90f3f25913b733.s1.eu.hivemq.cloud")
 MQTT_PORT = int(os.environ.get("HIVEMQ_PORT", "8883"))  # default secure MQTT port
 MQTT_USERNAME = os.environ.get("HIVEMQ_USER", "streamlit_client")
@@ -138,7 +139,9 @@ def parse_payload(payload):
 
     # Fallback: try comma/space-separated values (safe version)
     try:
-        cleaned = payload.replace('\n', '').replace('\r', '')
+        cleaned = payload.replace('
+', '').replace('
+', '')
         parts = [p.strip() for p in cleaned.split(',') if p.strip()]
         if len(parts) >= 3:
             return {
@@ -234,7 +237,7 @@ if len(st.session_state.light) > 0:
 # Footer: connection info and tips
 st.markdown("---")
 st.write("Broker:", MQTT_BROKER, "; Topic:", MQTT_TOPIC)
-st.info("TLS config:
+st.info("""TLS config:
 - Set HIVEMQ_CA_CERT to path of CA PEM file to verify broker certificate (optional).
 - For mutual TLS set HIVEMQ_CLIENT_CERT and HIVEMQ_CLIENT_KEY.
 - To disable cert verification (insecure) set HIVEMQ_TLS_INSECURE=1.
