@@ -66,7 +66,7 @@ st.markdown("""
 
 # ===== MQTT Configuration =====
 # ===== MQTT Configuration (HiveMQ Cloud) =====
-MQTT_BROKER = "c0ba63802d884690a923b132979daad3.s1.eu.hivemq.cloud"  # Ganti dengan host Anda
+MQTT_BROKER = "ac2c24cb9a454ce58c90f3f25913b733.s1.eu.hivemq.cloud"  # Ganti dengan host Anda
 MQTT_PORT = 8883                           # Port TLS/SSL
 MQTT_USERNAME = "esp32_client"             # Username Anda
 MQTT_PASSWORD = "KensellMHA245n10"         # Password Anda
