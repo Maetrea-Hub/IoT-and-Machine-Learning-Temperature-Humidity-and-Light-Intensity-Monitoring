@@ -4,8 +4,9 @@ Real-time monitoring of Temperature, Humidity, and Light Intensity
 with Machine Learning Classification
 
 Requirements:
-"""
+
 pip install streamlit paho-mqtt pandas plotly
+"""
 
 import streamlit as st
 import paho.mqtt.client as mqtt
