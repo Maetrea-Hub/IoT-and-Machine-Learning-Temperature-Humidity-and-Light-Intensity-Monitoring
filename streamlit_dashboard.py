@@ -1,3 +1,24 @@
+"""
+Streamlit MQTT Realtime Dashboard
+Displays Temperature, Humidity, and Light Intensity from topic: iot/ml/monitor/data
+
+How to use:
+1. Install dependencies:
+   pip install streamlit paho-mqtt
+2. Fill in your HiveMQ Cloud credentials below or set environment variables.
+3. Run:
+   streamlit run streamlit_mqtt_dashboard.py
+
+Assumptions:
+- MQTT payload is JSON, e.g. {"temperature":25.3, "humidity":60.1, "light":320, "timestamp":"2025-12-08T10:00:00Z"}
+- If payload is plain CSV or three values, the code will attempt to parse robustly.
+
+This single-file app starts an MQTT client in a background thread and pushes incoming sensor values
+into Streamlit's session_state for real-time display and simple charts.
+
+Update: Added support for custom TLS authentication (CA cert and optional client cert/key).
+"""
+
 import streamlit as st
 import paho.mqtt.client as mqtt
 import threading
@@ -8,7 +29,6 @@ from queue import Queue, Empty
 import os
 import ssl
 
-# ------------------------ Configuration (fill these or use env vars) ------------------------
 MQTT_BROKER = os.environ.get("HIVEMQ_HOST", "ac2c24cb9a454ce58c90f3f25913b733.s1.eu.hivemq.cloud")
 MQTT_PORT = int(os.environ.get("HIVEMQ_PORT", "8883"))  # default secure MQTT port
 MQTT_USERNAME = os.environ.get("HIVEMQ_USER", "streamlit_client")
@@ -116,10 +136,10 @@ def parse_payload(payload):
     except Exception:
         pass
 
-    # Fallback: try comma/space-separated values (temp,hum,light[,timestamp])
+    # Fallback: try comma/space-separated values (safe version)
     try:
-        parts = [p.strip() for p in payload.replace('\\n', '').split(',') if p.strip()]  # fixed string literal('
-','').split(',') if p.strip()]
+        cleaned = payload.replace('\n', '').replace('\r', '')
+        parts = [p.strip() for p in cleaned.split(',') if p.strip()]
         if len(parts) >= 3:
             return {
                 'temperature': float(parts[0]),
