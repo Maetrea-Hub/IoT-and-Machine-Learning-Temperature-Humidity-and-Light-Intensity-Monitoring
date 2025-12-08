@@ -118,7 +118,7 @@ def parse_payload(payload):
 
     # Fallback: try comma/space-separated values (temp,hum,light[,timestamp])
     try:
-        parts = [p.strip() for p in payload.replace('
+        parts = [p.strip() for p in payload.replace('\\n', '').split(',') if p.strip()]  # fixed string literal('
 ','').split(',') if p.strip()]
         if len(parts) >= 3:
             return {
