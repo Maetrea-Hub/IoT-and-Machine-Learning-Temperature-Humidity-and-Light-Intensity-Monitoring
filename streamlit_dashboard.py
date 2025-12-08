@@ -80,7 +80,7 @@ MQTT_BROKER = "ac2c24cb9a454ce58c90f3f25913b733.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 MQTT_USERNAME = "esp32_client"
 MQTT_PASSWORD = "KensellMHA245n10"
-MQTT_TOPIC = "iot/ml/monitor/data"
+MQTT_TOPIC = "iot/ml/monitor/#"
 MQTT_CLIENT_ID = "Streamlit_Dashboard_001"
 
 # ===== Initialize Session State =====
