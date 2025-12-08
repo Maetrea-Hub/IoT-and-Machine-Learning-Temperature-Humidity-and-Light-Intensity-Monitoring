@@ -76,10 +76,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ===== MQTT Configuration =====
-MQTT_BROKER = "ac2c24cb9a454ce58c90f3f25913b733.s1.eu.hivemq.cloud"
-MQTT_PORT = 8883
-MQTT_USERNAME = "esp32_client"
-MQTT_PASSWORD = "KensellMHA245n10"
+MQTT_BROKER = "broker.hivemq.com"
+MQTT_PORT = 1883
+MQTT_USERNAME = None
+MQTT_PASSWORD = None
 MQTT_TOPIC = "iot/ml/monitor/data"
 MQTT_CLIENT_ID = "Streamlit_Dashboard_001"
 
