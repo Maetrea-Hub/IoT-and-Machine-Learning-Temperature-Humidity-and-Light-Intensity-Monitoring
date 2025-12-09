@@ -167,7 +167,7 @@ def init_mqtt():
         # Create client
         client = mqtt.Client(
             client_id=MQTT_CLIENT_ID,
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            transport="websockets",
             protocol=mqtt.MQTTv5
         )
         
@@ -195,7 +195,7 @@ def init_mqtt():
         print(f"🔌 Connecting to {MQTT_BROKER}:{MQTT_PORT}")
         
         # Connect
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        client.connect(MQTT_BROKER, 8884, 60)
         client.loop_start()
         
         print("✅ MQTT started")
