@@ -1,6 +1,6 @@
 """
 Temperature, Humidity, and Light Intensity Monitoring Dashboard
-Real-time IoT Dashboard with MQTT Integration (HiveMQ Cloud)
+FIXED: Proper MQTT integration with Streamlit (no session state in callbacks)
 """
 
 import streamlit as st
@@ -11,7 +11,9 @@ import pandas as pd
 from datetime import datetime
 import plotly.graph_objects as go
 import time
-import certifi
+import tempfile
+import random
+import queue
 
 # ===== Page Configuration =====
 st.set_page_config(
@@ -64,12 +66,14 @@ st.markdown("""
 # ===== MQTT Configuration =====
 MQTT_BROKER = "ac2c24cb9a454ce58c90f3f25913b733.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
-MQTT_USERNAME = "streamlit_client"
+MQTT_USERNAME = "esp32_client"
 MQTT_PASSWORD = "KensellMHA245n10"
 MQTT_TOPIC = "iot/ml/monitor/data"
-MQTT_CLIENT_ID = "Streamlit_Dashboard_IoT_ML"
 
-# ISRG Root X1 Certificate (Used by HiveMQ)
+# Generate unique client ID to avoid "session taken over"
+MQTT_CLIENT_ID = f"Streamlit_Dashboard_{random.randint(1000, 9999)}"
+
+# ISRG Root X1 Certificate
 ROOT_CA_CERT = """-----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
 TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
@@ -102,75 +106,65 @@ mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
 emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----"""
 
-# ===== Session State Initialization =====
-if 'data' not in st.session_state:
-    st.session_state.data = []
-if 'mqtt_connected' not in st.session_state:
-    st.session_state.mqtt_connected = False
-if 'latest_data' not in st.session_state:
-    st.session_state.latest_data = {
-        'temperature': 0.0,
-        'humidity': 0.0,
-        'lightIntensity': 0,
-        'lightCondition': 'Terang',
-        'mlClassification': 'normal',
-        'timestamp': datetime.now()
-    }
-if 'message_count' not in st.session_state:
-    st.session_state.message_count = 0
+# ===== Global Data Storage (NOT session_state) =====
+# Use module-level variables for MQTT callback access
+mqtt_data_queue = queue.Queue()
+mqtt_connected = False
 
 # ===== MQTT Callbacks =====
 def on_connect(client, userdata, flags, rc, properties=None):
     """Called when connected to MQTT broker"""
+    global mqtt_connected
+    
     if rc == 0:
-        st.session_state.mqtt_connected = True
+        mqtt_connected = True
         client.subscribe(MQTT_TOPIC, qos=1)
-        print(f"✅ Connected to MQTT and subscribed to {MQTT_TOPIC}")
+        print(f"✅ Connected to MQTT (Client ID: {MQTT_CLIENT_ID})")
+        print(f"📥 Subscribed to: {MQTT_TOPIC}")
     else:
-        st.session_state.mqtt_connected = False
-        error_msgs = {
-            1: "Protocol version error",
+        mqtt_connected = False
+        errors = {
+            1: "Protocol version",
             2: "Client ID rejected",
             3: "Server unavailable",
-            4: "Bad username/password",
+            4: "Bad credentials",
             5: "Not authorized"
         }
-        print(f"❌ Connection failed: {error_msgs.get(rc, f'Unknown error {rc}')}")
+        print(f"❌ Connection failed: {errors.get(rc, f'Error {rc}')}")
 
 def on_message(client, userdata, msg):
-    """Called when message received"""
+    """Called when message received - put in queue instead of session_state"""
     try:
         payload = json.loads(msg.payload.decode())
         payload['timestamp'] = datetime.now()
         
-        st.session_state.latest_data = payload
-        st.session_state.data.append(payload)
-        st.session_state.message_count += 1
+        # Put in queue (thread-safe)
+        mqtt_data_queue.put(payload)
         
-        # Keep last 300 readings
-        if len(st.session_state.data) > 300:
-            st.session_state.data.pop(0)
-        
-        print(f"📨 Message {st.session_state.message_count}: T={payload['temperature']}°C, H={payload['humidity']}%")
+        print(f"📨 Received: T={payload['temperature']}°C, H={payload['humidity']}%")
         
     except Exception as e:
         print(f"❌ Error: {e}")
 
 def on_disconnect(client, userdata, flags, rc, properties=None):
     """Called when disconnected"""
-    st.session_state.mqtt_connected = False
-    print(f"⚠️ Disconnected (rc={rc})")
+    global mqtt_connected
+    mqtt_connected = False
+    
+    if rc != 0:
+        print(f"⚠️ Unexpected disconnect (rc={rc})")
 
-# ===== Initialize MQTT with Proper TLS =====
+# ===== Initialize MQTT =====
 @st.cache_resource
 def init_mqtt():
-    """Initialize MQTT client with proper certificate handling"""
+    """Initialize MQTT client"""
     print("\n" + "="*60)
-    print("🔌 Initializing MQTT Connection to HiveMQ Cloud")
+    print("🔌 Initializing MQTT Connection")
     print("="*60)
+    print(f"Client ID: {MQTT_CLIENT_ID}")
     
     try:
-        # Create MQTT client
+        # Create client
         client = mqtt.Client(
             client_id=MQTT_CLIENT_ID,
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -185,42 +179,69 @@ def init_mqtt():
         # Set credentials
         client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
         
-        # Write certificate to temporary file
-        import tempfile
-        import os
-        
+        # Write certificate to temp file
         cert_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.pem')
         cert_file.write(ROOT_CA_CERT)
         cert_file.close()
         
-        # Configure TLS with certificate
+        # Configure TLS
         client.tls_set(
             ca_certs=cert_file.name,
             cert_reqs=ssl.CERT_REQUIRED,
             tls_version=ssl.PROTOCOL_TLSv1_2
         )
         
-        print(f"✅ Certificate configured: {cert_file.name}")
+        print(f"✅ Certificate: {cert_file.name}")
         print(f"🔌 Connecting to {MQTT_BROKER}:{MQTT_PORT}")
         
         # Connect
         client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        
-        # Start loop
         client.loop_start()
         
-        print("✅ MQTT client started")
+        print("✅ MQTT started")
         
         return client
         
     except Exception as e:
-        print(f"❌ MQTT Error: {type(e).__name__}: {e}")
+        print(f"❌ Error: {e}")
         return None
+
+# ===== Session State Init =====
+if 'data' not in st.session_state:
+    st.session_state.data = []
+if 'latest_data' not in st.session_state:
+    st.session_state.latest_data = {
+        'temperature': 0.0,
+        'humidity': 0.0,
+        'lightIntensity': 0,
+        'lightCondition': 'Terang',
+        'mlClassification': 'normal',
+        'timestamp': datetime.now()
+    }
 
 # ===== Main Dashboard =====
 def main():
     # Initialize MQTT
     mqtt_client = init_mqtt()
+    
+    # Process queued messages (move from queue to session_state)
+    new_messages = 0
+    while not mqtt_data_queue.empty():
+        try:
+            data = mqtt_data_queue.get_nowait()
+            st.session_state.latest_data = data
+            st.session_state.data.append(data)
+            new_messages += 1
+            
+            # Keep last 300 readings
+            if len(st.session_state.data) > 300:
+                st.session_state.data.pop(0)
+                
+        except queue.Empty:
+            break
+    
+    if new_messages > 0:
+        print(f"✅ Processed {new_messages} messages from queue")
     
     # Title
     st.markdown("""
@@ -233,23 +254,27 @@ def main():
     col_status1, col_status2, col_status3 = st.columns(3)
     
     with col_status1:
-        if st.session_state.mqtt_connected:
+        if mqtt_connected:
             st.success("✅ MQTT Connected")
         else:
             st.error("❌ MQTT Disconnected")
     
     with col_status2:
-        st.info(f"📊 Messages: {st.session_state.message_count}")
+        st.info(f"📊 Data Points: {len(st.session_state.data)}")
     
     with col_status3:
-        st.info(f"💾 Data Points: {len(st.session_state.data)}")
+        if len(st.session_state.data) > 0:
+            last_time = st.session_state.latest_data['timestamp']
+            elapsed = (datetime.now() - last_time).seconds
+            st.info(f"⏱️ Last update: {elapsed}s ago")
+        else:
+            st.info("⏱️ Waiting for data...")
     
-    # Get latest data
     latest = st.session_state.latest_data
     
     st.markdown("---")
     
-    # ===== Temperature and Humidity Charts (Side by Side) =====
+    # ===== Temperature and Humidity Charts =====
     col1, col2 = st.columns(2)
     
     with col1:
@@ -281,11 +306,10 @@ def main():
             )
             
             st.plotly_chart(fig_temp, use_container_width=True)
-            
-            # Current value
             st.metric("Current Temperature", f"{latest['temperature']:.1f}°C")
         else:
             st.info("⏳ Waiting for temperature data...")
+            st.metric("Current Temperature", "0.0°C")
     
     with col2:
         st.subheader("💧 Humidity")
@@ -316,15 +340,14 @@ def main():
             )
             
             st.plotly_chart(fig_hum, use_container_width=True)
-            
-            # Current value
             st.metric("Current Humidity", f"{latest['humidity']:.1f}%")
         else:
             st.info("⏳ Waiting for humidity data...")
+            st.metric("Current Humidity", "0.0%")
     
     st.markdown("---")
     
-    # ===== Light Intensity Status =====
+    # ===== Light Intensity =====
     st.subheader("💡 Light Intensity")
     
     light_condition = latest['lightCondition']
@@ -349,7 +372,7 @@ def main():
     
     st.markdown("---")
     
-    # ===== ML Classification Status =====
+    # ===== ML Classification =====
     st.subheader("🤖 Machine Learning Classification")
     
     ml_class = latest['mlClassification']
@@ -360,107 +383,101 @@ def main():
         if ml_class == "dingin":
             st.info("❄️ **Status: DINGIN**")
         else:
-            st.text("❄️ Status: dingin")
+            st.text("❄️ dingin")
     
     with col_ml2:
         if ml_class == "normal":
             st.success("✅ **Status: NORMAL**")
         else:
-            st.text("✅ Status: normal")
+            st.text("✅ normal")
     
     with col_ml3:
         if ml_class == "panas":
             st.error("🔥 **Status: PANAS**")
         else:
-            st.text("🔥 Status: panas")
+            st.text("🔥 panas")
     
     st.markdown("---")
     
-    # ===== Download CSV Section =====
+    # ===== Download CSV =====
     st.subheader("💾 Download Data")
     
     if len(st.session_state.data) > 0:
         df = pd.DataFrame(st.session_state.data)
         
-        # Prepare CSV data
+        # Prepare CSV
         csv_data = df[['timestamp', 'temperature', 'humidity', 'lightCondition']].copy()
         csv_data['timestamp'] = csv_data['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
-        
         csv_string = csv_data.to_csv(index=False)
         
-        col_download1, col_download2, col_download3 = st.columns(3)
+        col_dl1, col_dl2, col_dl3 = st.columns(3)
         
-        with col_download1:
+        with col_dl1:
             st.download_button(
-                label="📥 Download Essential Data (CSV)",
+                label="📥 Download Essential Data",
                 data=csv_string,
                 file_name=f"iot_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
                 use_container_width=True
             )
         
-        with col_download2:
-            # Full dataset with ML classification
-            full_csv_data = df[['timestamp', 'temperature', 'humidity', 'lightCondition', 'mlClassification']].copy()
-            full_csv_data['timestamp'] = full_csv_data['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
-            full_csv_string = full_csv_data.to_csv(index=False)
+        with col_dl2:
+            full_csv = df[['timestamp', 'temperature', 'humidity', 'lightCondition', 'mlClassification']].copy()
+            full_csv['timestamp'] = full_csv['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            full_csv_string = full_csv.to_csv(index=False)
             
             st.download_button(
-                label="📥 Download with ML Data (CSV)",
+                label="📥 Download with ML Data",
                 data=full_csv_string,
-                file_name=f"iot_ml_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                file_name=f"iot_ml_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
                 use_container_width=True
             )
         
-        with col_download3:
-            # Complete dataset
+        with col_dl3:
             complete_csv = df.copy()
             complete_csv['timestamp'] = complete_csv['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
             complete_csv_string = complete_csv.to_csv(index=False)
             
             st.download_button(
-                label="📥 Download Complete Data (CSV)",
+                label="📥 Download Complete",
                 data=complete_csv_string,
                 file_name=f"iot_complete_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
                 use_container_width=True
             )
         
-        # Show preview
-        st.markdown("#### 📋 Data Preview (Last 10 entries)")
-        preview_df = csv_data.tail(10).sort_values('timestamp', ascending=False)
-        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+        # Preview
+        st.markdown("#### 📋 Data Preview (Last 10)")
+        preview = csv_data.tail(10).sort_values('timestamp', ascending=False)
+        st.dataframe(preview, use_container_width=True, hide_index=True)
         
         # Statistics
-        st.markdown("#### 📊 Statistics Summary")
-        col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+        st.markdown("#### 📊 Statistics")
+        col_s1, col_s2, col_s3, col_s4 = st.columns(4)
         
-        with col_stat1:
-            st.metric("Avg Temperature", f"{df['temperature'].mean():.1f}°C")
-        with col_stat2:
+        with col_s1:
+            st.metric("Avg Temp", f"{df['temperature'].mean():.1f}°C")
+        with col_s2:
             st.metric("Avg Humidity", f"{df['humidity'].mean():.1f}%")
-        with col_stat3:
-            terang_count = (df['lightCondition'] == 'Terang').sum()
-            st.metric("Terang Count", terang_count)
-        with col_stat4:
-            gelap_count = (df['lightCondition'] == 'Gelap').sum()
-            st.metric("Gelap Count", gelap_count)
-        
+        with col_s3:
+            terang = (df['lightCondition'] == 'Terang').sum()
+            st.metric("Terang", terang)
+        with col_s4:
+            gelap = (df['lightCondition'] == 'Gelap').sum()
+            st.metric("Gelap", gelap)
     else:
-        st.warning("⚠️ No data available for download yet.")
+        st.warning("⚠️ No data available")
         st.info("""
-        **Waiting for data from ESP32...**
-        
-        Please ensure:
-        1. ✅ ESP32 is powered on
-        2. ✅ Connected to WiFi
-        3. ✅ Connected to MQTT broker
-        4. ✅ Publishing to topic: `iot/ml/monitor/data`
+        **Ensure ESP32 is:**
+        - ✅ Powered on
+        - ✅ Connected to WiFi
+        - ✅ Connected to MQTT
+        - ✅ Publishing to `iot/ml/monitor/data`
         """)
     
-    # Auto-refresh
-    time.sleep(2)
+    # Auto-refresh every 5 seconds
+    time.sleep(5)
     st.rerun()
 
 if __name__ == "__main__":
