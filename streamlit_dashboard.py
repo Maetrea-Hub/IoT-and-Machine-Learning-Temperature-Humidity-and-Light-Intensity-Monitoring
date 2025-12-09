@@ -1,6 +1,6 @@
 """
 Temperature, Humidity, and Light Intensity Monitoring Dashboard
-WORKING VERSION - Real-time data updates with proper queue processing
+FIXED: Proper MQTT integration with Streamlit (no session state in callbacks)
 """
 
 import streamlit as st
@@ -14,7 +14,6 @@ import time
 import tempfile
 import random
 import queue
-import threading
 
 # ===== Page Configuration =====
 st.set_page_config(
@@ -71,6 +70,9 @@ MQTT_USERNAME = "esp32_client"
 MQTT_PASSWORD = "KensellMHA245n10"
 MQTT_TOPIC = "iot/ml/monitor/data"
 
+# Generate unique client ID to avoid "session taken over"
+MQTT_CLIENT_ID = f"Streamlit_Dashboard_{random.randint(1000, 9999)}"
+
 # ISRG Root X1 Certificate
 ROOT_CA_CERT = """-----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
@@ -104,97 +106,105 @@ mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
 emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----"""
 
-# ===== Global Queue (Module-level, thread-safe) =====
-GLOBAL_QUEUE = queue.Queue()
-MQTT_CONNECTED = False
-MQTT_CLIENT_ID = f"Streamlit_Dashboard_{random.randint(1000, 9999)}"
+# ===== Global Data Storage (NOT session_state) =====
+# Use module-level variables for MQTT callback access
+mqtt_data_queue = queue.Queue()
+mqtt_connected = False
 
-# ===== MQTT Callbacks (Use GLOBAL_QUEUE, NOT session_state) =====
+# ===== MQTT Callbacks =====
 def on_connect(client, userdata, flags, rc, properties=None):
-    """Called when connected"""
-    global MQTT_CONNECTED
+    """Called when connected to MQTT broker"""
+    global mqtt_connected
     
     if rc == 0:
-        MQTT_CONNECTED = True
+        mqtt_connected = True
         client.subscribe(MQTT_TOPIC, qos=1)
-        GLOBAL_QUEUE.put({"_type": "status", "connected": True})
-        print(f"✅ Connected to MQTT (Client: {MQTT_CLIENT_ID})")
+        print(f"✅ Connected to MQTT (Client ID: {MQTT_CLIENT_ID})")
         print(f"📥 Subscribed to: {MQTT_TOPIC}")
     else:
-        MQTT_CONNECTED = False
-        GLOBAL_QUEUE.put({"_type": "status", "connected": False})
-        errors = {1: "Protocol", 2: "Client ID", 3: "Unavailable", 4: "Bad credentials", 5: "Unauthorized"}
+        mqtt_connected = False
+        errors = {
+            1: "Protocol version",
+            2: "Client ID rejected",
+            3: "Server unavailable",
+            4: "Bad credentials",
+            5: "Not authorized"
+        }
         print(f"❌ Connection failed: {errors.get(rc, f'Error {rc}')}")
 
 def on_message(client, userdata, msg):
-    """Called when message received - put in GLOBAL_QUEUE"""
+    """Called when message received - put in queue instead of session_state"""
     try:
         payload = json.loads(msg.payload.decode())
-        # Add timestamp and put in queue
-        GLOBAL_QUEUE.put({"_type": "sensor", "data": payload, "ts": time.time()})
-        print(f"📨 Received: T={payload.get('temperature')}°C, H={payload.get('humidity')}%")
+        payload['timestamp'] = datetime.now()
+        
+        # Put in queue (thread-safe)
+        mqtt_data_queue.put(payload)
+        
+        print(f"📨 Now Received: Temp={payload['temperature']}°C, Hum={payload['humidity']}%")
+        
     except Exception as e:
-        print(f"❌ Parse error: {e}")
+        print(f"❌ Error: {e}")
 
 def on_disconnect(client, userdata, flags, rc, properties=None):
     """Called when disconnected"""
-    global MQTT_CONNECTED
-    MQTT_CONNECTED = False
-    GLOBAL_QUEUE.put({"_type": "status", "connected": False})
+    global mqtt_connected
+    mqtt_connected = False
+    
     if rc != 0:
         print(f"⚠️ Unexpected disconnect (rc={rc})")
 
-# ===== MQTT Worker Thread =====
-def mqtt_worker():
-    """Worker thread that runs MQTT client loop"""
-    while True:
-        try:
-            # Create client
-            client = mqtt.Client(
-                client_id=MQTT_CLIENT_ID,
-                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-                protocol=mqtt.MQTTv5
-            )
-            
-            # Set callbacks
-            client.on_connect = on_connect
-            client.on_message = on_message
-            client.on_disconnect = on_disconnect
-            
-            # Set credentials
-            client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-            
-            # Configure TLS
-            cert_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.pem')
-            cert_file.write(ROOT_CA_CERT)
-            cert_file.close()
-            
-            client.tls_set(
-                ca_certs=cert_file.name,
-                cert_reqs=ssl.CERT_REQUIRED,
-                tls_version=ssl.PROTOCOL_TLSv1_2
-            )
-            
-            print(f"🔌 Connecting to {MQTT_BROKER}:{MQTT_PORT}")
-            
-            # Connect and loop forever
-            client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            client.loop_forever()
-            
-        except Exception as e:
-            print(f"❌ MQTT worker error: {e}")
-            time.sleep(5)  # Backoff before retry
-
-# ===== Start MQTT Thread Once =====
-if "mqtt_thread_started" not in st.session_state:
-    st.session_state.mqtt_thread_started = False
-
-if not st.session_state.mqtt_thread_started:
-    thread = threading.Thread(target=mqtt_worker, daemon=True, name="mqtt_worker")
-    thread.start()
-    st.session_state.mqtt_thread_started = True
-    print("🚀 MQTT worker thread started")
-    time.sleep(0.1)  # Give thread time to start
+# ===== Initialize MQTT =====
+@st.cache_resource
+def init_mqtt():
+    """Initialize MQTT client"""
+    print("\n" + "="*60)
+    print("🔌 Initializing MQTT Connection")
+    print("="*60)
+    print(f"Client ID: {MQTT_CLIENT_ID}")
+    
+    try:
+        # Create client
+        client = mqtt.Client(
+            client_id=MQTT_CLIENT_ID,
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            protocol=mqtt.MQTTv5
+        )
+        
+        # Set callbacks
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.on_disconnect = on_disconnect
+        
+        # Set credentials
+        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        
+        # Write certificate to temp file
+        cert_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.pem')
+        cert_file.write(ROOT_CA_CERT)
+        cert_file.close()
+        
+        # Configure TLS
+        client.tls_set(
+            ca_certs=cert_file.name,
+            cert_reqs=ssl.CERT_REQUIRED,
+            tls_version=ssl.PROTOCOL_TLSv1_2
+        )
+        
+        print(f"✅ Certificate: {cert_file.name}")
+        print(f"🔌 Connecting to {MQTT_BROKER}:{MQTT_PORT}")
+        
+        # Connect
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        client.loop_start()
+        
+        print("✅ MQTT started")
+        
+        return client
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return None
 
 # ===== Session State Init =====
 if 'data' not in st.session_state:
@@ -208,61 +218,31 @@ if 'latest_data' not in st.session_state:
         'mlClassification': 'normal',
         'timestamp': datetime.now()
     }
-if 'mqtt_status' not in st.session_state:
-    st.session_state.mqtt_status = False
-if 'message_count' not in st.session_state:
-    st.session_state.message_count = 0
-
-# ===== Process Queue Function =====
-def process_queue():
-    """Drain queue and update session_state (safe in main thread)"""
-    updated = False
-    
-    while not GLOBAL_QUEUE.empty():
-        try:
-            item = GLOBAL_QUEUE.get_nowait()
-            item_type = item.get("_type")
-            
-            if item_type == "status":
-                st.session_state.mqtt_status = item.get("connected", False)
-                updated = True
-                
-            elif item_type == "sensor":
-                data = item.get("data", {})
-                
-                # Create data row with timestamp
-                row = {
-                    'temperature': float(data.get('temperature', 0)),
-                    'humidity': float(data.get('humidity', 0)),
-                    'lightIntensity': int(data.get('lightIntensity', 0)),
-                    'lightCondition': data.get('lightCondition', 'Terang'),
-                    'mlClassification': data.get('mlClassification', 'normal'),
-                    'timestamp': datetime.fromtimestamp(item.get('ts', time.time()))
-                }
-                
-                # Update latest and append to history
-                st.session_state.latest_data = row
-                st.session_state.data.append(row)
-                st.session_state.message_count += 1
-                
-                # Keep last 500 readings
-                if len(st.session_state.data) > 500:
-                    st.session_state.data = st.session_state.data[-500:]
-                
-                updated = True
-                
-        except queue.Empty:
-            break
-        except Exception as e:
-            print(f"❌ Queue processing error: {e}")
-            break
-    
-    return updated
 
 # ===== Main Dashboard =====
 def main():
-    # Process queue FIRST (before rendering UI)
-    process_queue()
+    # Initialize MQTT
+    mqtt_client = init_mqtt()
+    
+    # Process queued messages (move from queue to session_state)
+    new_messages = 0
+    while not mqtt_data_queue.empty():
+        try:
+            data = mqtt_data_queue.get_nowait()
+            st.session_state.latest_data = data
+            st.session_state.data.append(data)
+            new_messages += 1
+            
+            # Keep last 300 readings
+            if len(st.session_state.data) > 300:
+                st.session_state.data.pop(0)
+                
+        except queue.Empty:
+            break
+    
+    if new_messages > 0:
+        print(f"✅ Processed {new_messages} messages from queue")
+        print(f"📊 Current data points: {len(st.session_state.data)}")
     
     # Title
     st.markdown("""
@@ -273,23 +253,23 @@ def main():
     
     # Connection Status
     col_status1, col_status2, col_status3 = st.columns(3)
-    
+
     with col_status1:
-        if st.session_state.mqtt_status:
+        if mqtt_client and mqtt_client.is_connected():
             st.success("✅ MQTT Connected")
         else:
             st.error("❌ MQTT Disconnected")
     
     with col_status2:
-        st.info(f"📊 Messages: {st.session_state.message_count}")
+        st.info(f"📊 Data Points: {len(st.session_state.data)}")
     
     with col_status3:
         if len(st.session_state.data) > 0:
             last_time = st.session_state.latest_data['timestamp']
             elapsed = (datetime.now() - last_time).seconds
-            st.info(f"⏱️ Last: {elapsed}s ago")
+            st.info(f"⏱️ Last update: {elapsed}s ago")
         else:
-            st.info("⏱️ Waiting...")
+            st.info("⏱️ Waiting for data...")
     
     latest = st.session_state.latest_data
     
@@ -474,7 +454,7 @@ def main():
         st.dataframe(preview, use_container_width=True, hide_index=True)
         
         # Statistics
-        st.markdown("#### 📊 Statistics Summary")
+        st.markdown("#### 📊 Statistics")
         col_s1, col_s2, col_s3, col_s4 = st.columns(4)
         
         with col_s1:
@@ -487,27 +467,18 @@ def main():
         with col_s4:
             gelap = (df['lightCondition'] == 'Gelap').sum()
             st.metric("Gelap", gelap)
-            
     else:
         st.warning("⚠️ No data available")
         st.info("""
         **Ensure ESP32 is:**
         - ✅ Powered on
-        - ✅ Connected to WiFi  
+        - ✅ Connected to WiFi
         - ✅ Connected to MQTT
         - ✅ Publishing to `iot/ml/monitor/data`
-        
-        **Check Serial Monitor for:**
-        ```
-        ✅ Data published to MQTT
-        ```
         """)
     
-    # Process queue again at end (catch any messages that arrived during render)
-    process_queue()
-    
-    # Auto-refresh every 3 seconds
-    time.sleep(3)
+    # Auto-refresh every 5 seconds
+    time.sleep(5)
     st.rerun()
 
 if __name__ == "__main__":
