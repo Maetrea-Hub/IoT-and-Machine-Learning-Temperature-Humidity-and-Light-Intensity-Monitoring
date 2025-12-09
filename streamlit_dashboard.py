@@ -1,6 +1,6 @@
 """
 Temperature, Humidity, and Light Intensity Monitoring Dashboard
-FIXED: Proper MQTT integration with Streamlit (no session state in callbacks)
+Working version based on successful app.py pattern
 """
 
 import streamlit as st
@@ -8,12 +8,13 @@ import paho.mqtt.client as mqtt
 import ssl
 import json
 import pandas as pd
+import numpy as np
 from datetime import datetime
 import plotly.graph_objects as go
 import time
 import tempfile
-import random
 import queue
+import threading
 
 # ===== Page Configuration =====
 st.set_page_config(
@@ -55,11 +56,6 @@ st.markdown("""
         background: linear-gradient(135deg, #434343 0%, #000000 100%);
         color: #fff;
     }
-    .stMetric {
-        background-color: #1e2130;
-        padding: 15px;
-        border-radius: 10px;
-    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -69,9 +65,7 @@ MQTT_PORT = 8883
 MQTT_USERNAME = "esp32_client"
 MQTT_PASSWORD = "KensellMHA245n10"
 MQTT_TOPIC = "iot/ml/monitor/data"
-
-# Generate unique client ID to avoid "session taken over"
-MQTT_CLIENT_ID = f"Streamlit_Dashboard_{random.randint(1000, 9999)}"
+MQTT_CLIENT_ID = "Streamlit_IoT_Dashboard"
 
 # ISRG Root X1 Certificate
 ROOT_CA_CERT = """-----BEGIN CERTIFICATE-----
@@ -106,83 +100,71 @@ mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
 emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----"""
 
-# ===== Global Data Storage (NOT session_state) =====
-# Use module-level variables for MQTT callback access
-mqtt_data_queue = queue.Queue()
-mqtt_connected = False
+# ===== Global Queue (Module Level - NOT session_state) =====
+GLOBAL_QUEUE = queue.Queue()
 
-# ===== MQTT Callbacks =====
+# ===== MQTT Callbacks (Use GLOBAL_QUEUE, NOT st.session_state) =====
 def on_connect(client, userdata, flags, rc, properties=None):
     """Called when connected to MQTT broker"""
-    global mqtt_connected
+    try:
+        client.subscribe(MQTT_TOPIC, qos=1)
+    except Exception:
+        pass
+    # Push connection status to queue
+    GLOBAL_QUEUE.put({
+        "_type": "status",
+        "connected": (rc == 0),
+        "ts": time.time()
+    })
     
     if rc == 0:
-        mqtt_connected = True
-        client.subscribe(MQTT_TOPIC, qos=1)
-        print(f"✅ Connected to MQTT (Client ID: {MQTT_CLIENT_ID})")
-        print(f"📥 Subscribed to: {MQTT_TOPIC}")
+        print(f"✅ Connected to MQTT - Subscribed to {MQTT_TOPIC}")
     else:
-        mqtt_connected = False
-        errors = {
-            1: "Protocol version",
-            2: "Client ID rejected",
-            3: "Server unavailable",
-            4: "Bad credentials",
-            5: "Not authorized"
-        }
-        print(f"❌ Connection failed: {errors.get(rc, f'Error {rc}')}")
+        print(f"❌ Connection failed (rc={rc})")
 
 def on_message(client, userdata, msg):
-    """Called when message received - put in queue instead of session_state"""
+    """Called when message received - put in GLOBAL_QUEUE"""
+    payload = msg.payload.decode(errors="ignore")
     try:
-        payload = json.loads(msg.payload.decode())
-        payload['timestamp'] = datetime.now()
-        
-        # Put in queue (thread-safe)
-        mqtt_data_queue.put(payload)
-        
-        print(f"📨 Now Received: Temp={payload['temperature']}°C, Hum={payload['humidity']}%")
-        
-    except Exception as e:
-        print(f"❌ Error: {e}")
-
-def on_disconnect(client, userdata, flags, rc, properties=None):
-    """Called when disconnected"""
-    global mqtt_connected
-    mqtt_connected = False
+        data = json.loads(payload)
+    except Exception:
+        # Push raw payload if JSON parse fails
+        GLOBAL_QUEUE.put({
+            "_type": "raw",
+            "payload": payload,
+            "ts": time.time()
+        })
+        return
     
-    if rc != 0:
-        print(f"⚠️ Unexpected disconnect (rc={rc})")
-
-# ===== Initialize MQTT =====
-@st.cache_resource
-def init_mqtt():
-    """Initialize MQTT client"""
-    print("\n" + "="*60)
-    print("🔌 Initializing MQTT Connection")
-    print("="*60)
-    print(f"Client ID: {MQTT_CLIENT_ID}")
+    # Push structured sensor message to queue
+    GLOBAL_QUEUE.put({
+        "_type": "sensor",
+        "data": data,
+        "ts": time.time(),
+        "topic": msg.topic
+    })
     
-    try:
-        # Create client
+    print(f"📨 Queued: Temp={data.get('temperature')}°C, Hum={data.get('humidity')}%")
+
+# ===== Start MQTT Thread (Worker) =====
+def start_mqtt_thread_once():
+    """Start MQTT client in background thread"""
+    def worker():
+        # Write certificate to temp file
+        cert_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.pem')
+        cert_file.write(ROOT_CA_CERT)
+        cert_file.close()
+        
         client = mqtt.Client(
             client_id=MQTT_CLIENT_ID,
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             protocol=mqtt.MQTTv5
         )
-        
-        # Set callbacks
         client.on_connect = on_connect
         client.on_message = on_message
-        client.on_disconnect = on_disconnect
         
         # Set credentials
         client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-        
-        # Write certificate to temp file
-        cert_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.pem')
-        cert_file.write(ROOT_CA_CERT)
-        cert_file.close()
         
         # Configure TLS
         client.tls_set(
@@ -191,58 +173,112 @@ def init_mqtt():
             tls_version=ssl.PROTOCOL_TLSv1_2
         )
         
-        print(f"✅ Certificate: {cert_file.name}")
-        print(f"🔌 Connecting to {MQTT_BROKER}:{MQTT_PORT}")
-        
-        # Connect
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        client.loop_start()
-        
-        print("✅ MQTT started")
-        
-        return client
-        
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        return None
+        while True:
+            try:
+                print(f"🔌 Connecting to {MQTT_BROKER}:{MQTT_PORT}")
+                client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+                client.loop_forever()
+            except Exception as e:
+                # Push error to queue
+                GLOBAL_QUEUE.put({
+                    "_type": "error",
+                    "msg": f"MQTT error: {e}",
+                    "ts": time.time()
+                })
+                print(f"❌ MQTT error: {e}")
+                time.sleep(5)  # Backoff then retry
+    
+    if not st.session_state.mqtt_thread_started:
+        t = threading.Thread(target=worker, daemon=True, name="mqtt_worker")
+        t.start()
+        st.session_state.mqtt_thread_started = True
+        time.sleep(0.1)  # Give thread time to start
 
 # ===== Session State Init =====
-if 'data' not in st.session_state:
-    st.session_state.data = []
-if 'latest_data' not in st.session_state:
-    st.session_state.latest_data = {
-        'temperature': 0.0,
-        'humidity': 0.0,
-        'lightIntensity': 0,
-        'lightCondition': 'Terang',
-        'mlClassification': 'normal',
-        'timestamp': datetime.now()
-    }
+if "msg_queue" not in st.session_state:
+    st.session_state.msg_queue = GLOBAL_QUEUE
 
-# ===== Main Dashboard =====
-def main():
-    # Initialize MQTT
-    mqtt_client = init_mqtt()
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+
+if "last" not in st.session_state:
+    st.session_state.last = None
+
+if "last_status" not in st.session_state:
+    st.session_state.last_status = False
+
+if "mqtt_thread_started" not in st.session_state:
+    st.session_state.mqtt_thread_started = False
+
+# ===== Process Queue (Drain messages) =====
+def process_queue():
+    """Process all messages in queue and update session_state"""
+    updated = False
+    q = st.session_state.msg_queue
     
-    # Process queued messages (move from queue to session_state)
-    new_messages = 0
-    while not mqtt_data_queue.empty():
+    while not q.empty():
         try:
-            data = mqtt_data_queue.get_nowait()
-            st.session_state.latest_data = data
-            st.session_state.data.append(data)
-            new_messages += 1
+            item = q.get_nowait()
+            ttype = item.get("_type")
             
-            # Keep last 300 readings
-            if len(st.session_state.data) > 300:
-                st.session_state.data.pop(0)
+            if ttype == "status":
+                # Connection status
+                st.session_state.last_status = item.get("connected", False)
+                updated = True
+                
+            elif ttype == "error":
+                # Error message
+                print(f"⚠️ {item.get('msg')}")
+                updated = True
+                
+            elif ttype == "raw":
+                # Raw payload
+                row = {
+                    "ts": datetime.fromtimestamp(item.get("ts", time.time())).strftime("%Y-%m-%d %H:%M:%S"),
+                    "raw": item.get("payload")
+                }
+                st.session_state.logs.append(row)
+                st.session_state.last = row
+                updated = True
+                
+            elif ttype == "sensor":
+                # Sensor data
+                d = item.get("data", {})
+                
+                row = {
+                    "ts": datetime.fromtimestamp(item.get("ts", time.time())).strftime("%Y-%m-%d %H:%M:%S"),
+                    "temperature": d.get("temperature"),
+                    "humidity": d.get("humidity"),
+                    "lightIntensity": d.get("lightIntensity"),
+                    "lightCondition": d.get("lightCondition"),
+                    "mlClassification": d.get("mlClassification")
+                }
+                
+                st.session_state.last = row
+                st.session_state.logs.append(row)
+                
+                # Keep bounded (last 500 entries)
+                if len(st.session_state.logs) > 500:
+                    st.session_state.logs = st.session_state.logs[-500:]
+                
+                updated = True
+                print(f"✅ Processed: Temp={row['temperature']}°C")
                 
         except queue.Empty:
             break
+        except Exception as e:
+            print(f"❌ Process error: {e}")
+            break
     
-    if new_messages > 0:
-        print(f"✅ Processed {new_messages} messages from queue")
-        print(f"📊 Current data points: {len(st.session_state.data)}")
+    return updated
+
+# ===== Main Dashboard =====
+def main():
+    # Start MQTT thread once
+    start_mqtt_thread_once()
+    
+    # Process incoming messages
+    process_queue()
     
     # Title
     st.markdown("""
@@ -253,27 +289,35 @@ def main():
     
     # Connection Status
     col_status1, col_status2, col_status3 = st.columns(3)
-
+    
     with col_status1:
-        if mqtt_client and mqtt_client.is_connected():
+        if st.session_state.last_status:
             st.success("✅ MQTT Connected")
         else:
             st.error("❌ MQTT Disconnected")
     
     with col_status2:
-        st.info(f"📊 Data Points: {len(st.session_state.data)}")
+        st.info(f"📊 Data Points: {len(st.session_state.logs)}")
     
     with col_status3:
-        if len(st.session_state.data) > 0:
-            last_time = st.session_state.latest_data['timestamp']
-            elapsed = (datetime.now() - last_time).seconds
-            st.info(f"⏱️ Last update: {elapsed}s ago")
+        if st.session_state.last:
+            st.info(f"⏱️ Last: {st.session_state.last.get('ts', 'N/A')}")
         else:
-            st.info("⏱️ Waiting for data...")
-    
-    latest = st.session_state.latest_data
+            st.info("⏱️ Waiting...")
     
     st.markdown("---")
+    
+    # Get latest data
+    if st.session_state.last:
+        latest = st.session_state.last
+    else:
+        latest = {
+            'temperature': 0.0,
+            'humidity': 0.0,
+            'lightIntensity': 0,
+            'lightCondition': 'Terang',
+            'mlClassification': 'normal'
+        }
     
     # ===== Temperature and Humidity Charts =====
     col1, col2 = st.columns(2)
@@ -281,78 +325,86 @@ def main():
     with col1:
         st.subheader("🌡️ Temperature")
         
-        if len(st.session_state.data) > 0:
-            df = pd.DataFrame(st.session_state.data)
+        if len(st.session_state.logs) > 0:
+            df = pd.DataFrame(st.session_state.logs)
             
-            fig_temp = go.Figure()
-            fig_temp.add_trace(go.Scatter(
-                x=df['timestamp'],
-                y=df['temperature'],
-                mode='lines+markers',
-                name='Temperature',
-                line=dict(color='#ff6b6b', width=3),
-                marker=dict(size=6),
-                fill='tozeroy',
-                fillcolor='rgba(255, 107, 107, 0.2)'
-            ))
+            # Filter valid temperature data
+            df_temp = df[df['temperature'].notna()]
             
-            fig_temp.update_layout(
-                height=400,
-                template='plotly_dark',
-                xaxis_title="Time",
-                yaxis_title="Temperature (°C)",
-                hovermode='x unified',
-                showlegend=False,
-                margin=dict(l=20, r=20, t=40, b=20)
-            )
-            
-            st.plotly_chart(fig_temp, use_container_width=True)
-            st.metric("Current Temperature", f"{latest['temperature']:.1f}°C")
+            if len(df_temp) > 0:
+                fig_temp = go.Figure()
+                fig_temp.add_trace(go.Scatter(
+                    x=list(range(len(df_temp))),
+                    y=df_temp['temperature'],
+                    mode='lines+markers',
+                    name='Temperature',
+                    line=dict(color='#ff6b6b', width=3),
+                    marker=dict(size=6),
+                    fill='tozeroy',
+                    fillcolor='rgba(255, 107, 107, 0.2)'
+                ))
+                
+                fig_temp.update_layout(
+                    height=400,
+                    template='plotly_dark',
+                    xaxis_title="Reading #",
+                    yaxis_title="Temperature (°C)",
+                    showlegend=False,
+                    margin=dict(l=20, r=20, t=40, b=20)
+                )
+                
+                st.plotly_chart(fig_temp, use_container_width=True)
+                st.metric("Current", f"{latest.get('temperature', 0):.1f}°C")
+            else:
+                st.info("⏳ No temperature data yet")
         else:
-            st.info("⏳ Waiting for temperature data...")
-            st.metric("Current Temperature", "0.0°C")
+            st.info("⏳ Waiting for data...")
     
     with col2:
         st.subheader("💧 Humidity")
         
-        if len(st.session_state.data) > 0:
-            df = pd.DataFrame(st.session_state.data)
+        if len(st.session_state.logs) > 0:
+            df = pd.DataFrame(st.session_state.logs)
             
-            fig_hum = go.Figure()
-            fig_hum.add_trace(go.Scatter(
-                x=df['timestamp'],
-                y=df['humidity'],
-                mode='lines+markers',
-                name='Humidity',
-                line=dict(color='#4ecdc4', width=3),
-                marker=dict(size=6),
-                fill='tozeroy',
-                fillcolor='rgba(78, 205, 196, 0.2)'
-            ))
+            # Filter valid humidity data
+            df_hum = df[df['humidity'].notna()]
             
-            fig_hum.update_layout(
-                height=400,
-                template='plotly_dark',
-                xaxis_title="Time",
-                yaxis_title="Humidity (%)",
-                hovermode='x unified',
-                showlegend=False,
-                margin=dict(l=20, r=20, t=40, b=20)
-            )
-            
-            st.plotly_chart(fig_hum, use_container_width=True)
-            st.metric("Current Humidity", f"{latest['humidity']:.1f}%")
+            if len(df_hum) > 0:
+                fig_hum = go.Figure()
+                fig_hum.add_trace(go.Scatter(
+                    x=list(range(len(df_hum))),
+                    y=df_hum['humidity'],
+                    mode='lines+markers',
+                    name='Humidity',
+                    line=dict(color='#4ecdc4', width=3),
+                    marker=dict(size=6),
+                    fill='tozeroy',
+                    fillcolor='rgba(78, 205, 196, 0.2)'
+                ))
+                
+                fig_hum.update_layout(
+                    height=400,
+                    template='plotly_dark',
+                    xaxis_title="Reading #",
+                    yaxis_title="Humidity (%)",
+                    showlegend=False,
+                    margin=dict(l=20, r=20, t=40, b=20)
+                )
+                
+                st.plotly_chart(fig_hum, use_container_width=True)
+                st.metric("Current", f"{latest.get('humidity', 0):.1f}%")
+            else:
+                st.info("⏳ No humidity data yet")
         else:
-            st.info("⏳ Waiting for humidity data...")
-            st.metric("Current Humidity", "0.0%")
+            st.info("⏳ Waiting for data...")
     
     st.markdown("---")
     
     # ===== Light Intensity =====
     st.subheader("💡 Light Intensity")
     
-    light_condition = latest['lightCondition']
-    light_intensity = latest['lightIntensity']
+    light_condition = latest.get('lightCondition', 'Terang')
+    light_intensity = latest.get('lightIntensity', 0)
     
     if light_condition == "Gelap":
         st.markdown(f"""
@@ -376,25 +428,25 @@ def main():
     # ===== ML Classification =====
     st.subheader("🤖 Machine Learning Classification")
     
-    ml_class = latest['mlClassification']
+    ml_class = latest.get('mlClassification', 'normal')
     
     col_ml1, col_ml2, col_ml3 = st.columns(3)
     
     with col_ml1:
         if ml_class == "dingin":
-            st.info("❄️ **Status: DINGIN**")
+            st.info("❄️ **DINGIN**")
         else:
             st.text("❄️ dingin")
     
     with col_ml2:
         if ml_class == "normal":
-            st.success("✅ **Status: NORMAL**")
+            st.success("✅ **NORMAL**")
         else:
             st.text("✅ normal")
     
     with col_ml3:
         if ml_class == "panas":
-            st.error("🔥 **Status: PANAS**")
+            st.error("🔥 **PANAS**")
         else:
             st.text("🔥 panas")
     
@@ -403,19 +455,19 @@ def main():
     # ===== Download CSV =====
     st.subheader("💾 Download Data")
     
-    if len(st.session_state.data) > 0:
-        df = pd.DataFrame(st.session_state.data)
+    if len(st.session_state.logs) > 0:
+        df = pd.DataFrame(st.session_state.logs)
         
         # Prepare CSV
-        csv_data = df[['timestamp', 'temperature', 'humidity', 'lightCondition']].copy()
-        csv_data['timestamp'] = csv_data['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        csv_data = df[['ts', 'temperature', 'humidity', 'lightCondition']].copy()
+        csv_data.columns = ['timestamp', 'temperature', 'humidity', 'lightCondition']
         csv_string = csv_data.to_csv(index=False)
         
         col_dl1, col_dl2, col_dl3 = st.columns(3)
         
         with col_dl1:
             st.download_button(
-                label="📥 Download Essential Data",
+                label="📥 Essential Data",
                 data=csv_string,
                 file_name=f"iot_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
@@ -423,12 +475,12 @@ def main():
             )
         
         with col_dl2:
-            full_csv = df[['timestamp', 'temperature', 'humidity', 'lightCondition', 'mlClassification']].copy()
-            full_csv['timestamp'] = full_csv['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            full_csv = df[['ts', 'temperature', 'humidity', 'lightCondition', 'mlClassification']].copy()
+            full_csv.columns = ['timestamp', 'temperature', 'humidity', 'lightCondition', 'mlClassification']
             full_csv_string = full_csv.to_csv(index=False)
             
             st.download_button(
-                label="📥 Download with ML Data",
+                label="📥 With ML Data",
                 data=full_csv_string,
                 file_name=f"iot_ml_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
@@ -436,21 +488,19 @@ def main():
             )
         
         with col_dl3:
-            complete_csv = df.copy()
-            complete_csv['timestamp'] = complete_csv['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
-            complete_csv_string = complete_csv.to_csv(index=False)
+            complete_csv = df.to_csv(index=False)
             
             st.download_button(
-                label="📥 Download Complete",
-                data=complete_csv_string,
+                label="📥 Complete Data",
+                data=complete_csv,
                 file_name=f"iot_complete_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
                 use_container_width=True
             )
         
         # Preview
-        st.markdown("#### 📋 Data Preview (Last 10)")
-        preview = csv_data.tail(10).sort_values('timestamp', ascending=False)
+        st.markdown("#### 📋 Recent Data (Last 10)")
+        preview = csv_data.tail(10).iloc[::-1]  # Reverse to show latest first
         st.dataframe(preview, use_container_width=True, hide_index=True)
         
         # Statistics
@@ -458,27 +508,35 @@ def main():
         col_s1, col_s2, col_s3, col_s4 = st.columns(4)
         
         with col_s1:
-            st.metric("Avg Temp", f"{df['temperature'].mean():.1f}°C")
+            avg_temp = df['temperature'].dropna().mean()
+            st.metric("Avg Temp", f"{avg_temp:.1f}°C" if not np.isnan(avg_temp) else "N/A")
+        
         with col_s2:
-            st.metric("Avg Humidity", f"{df['humidity'].mean():.1f}%")
+            avg_hum = df['humidity'].dropna().mean()
+            st.metric("Avg Humidity", f"{avg_hum:.1f}%" if not np.isnan(avg_hum) else "N/A")
+        
         with col_s3:
             terang = (df['lightCondition'] == 'Terang').sum()
             st.metric("Terang", terang)
+        
         with col_s4:
             gelap = (df['lightCondition'] == 'Gelap').sum()
             st.metric("Gelap", gelap)
+        
     else:
         st.warning("⚠️ No data available")
         st.info("""
         **Ensure ESP32 is:**
         - ✅ Powered on
         - ✅ Connected to WiFi
-        - ✅ Connected to MQTT
         - ✅ Publishing to `iot/ml/monitor/data`
         """)
     
-    # Auto-refresh every 5 seconds
-    time.sleep(5)
+    # Process queue again at end of render
+    process_queue()
+    
+    # Auto-refresh every 2 seconds
+    time.sleep(2)
     st.rerun()
 
 if __name__ == "__main__":
