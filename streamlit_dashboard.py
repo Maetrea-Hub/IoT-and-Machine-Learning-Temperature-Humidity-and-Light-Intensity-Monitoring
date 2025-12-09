@@ -64,7 +64,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ===== MQTT Configuration =====
-MQTT_BROKER = "ac2c24cb9a454ce58c90f3f25913b733.s1.eu.hivemq.cloud"
+MQTT_BROKER = "ac2c24cb9a454ce58c90f3f25913b733.s1.eu.hivemq.cloud:8883"
 MQTT_PORT = 8883
 MQTT_USERNAME = "esp32_client"
 MQTT_PASSWORD = "KensellMHA245n10"
