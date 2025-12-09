@@ -1,254 +1,347 @@
-# streamlit_dashboard.py (stable for Streamlit Cloud)
+# app.py
 import streamlit as st
-import paho.mqtt.client as mqtt
-import ssl
-import json
 import pandas as pd
-from datetime import datetime, timezone, timedelta
-import plotly.graph_objects as go
-import threading
+import numpy as np
+import joblib
+import json
 import time
-import tempfile
-import random
 import queue
+import threading
+from datetime import datetime, timezone, timedelta
+import plotly.graph_objs as go
+import paho.mqtt.client as mqtt
+
+# Optional: lightweight auto-refresh helper (install in requirements). If you don't want it, remove next import and the st_autorefresh call below.
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTOREFRESH = True
+except Exception:
+    HAS_AUTOREFRESH = False
 
 # ---------------------------
-# Config (edit as needed)
+# Config (edit if needed)
 # ---------------------------
 MQTT_BROKER = "broker.hivemq.com"
-# If using WebSocket (recommended for Streamlit Cloud), set USE_WEBSOCKETS = True and MQTT_PORT accordingly (8884 for HiveMQ WSS)
-USE_WEBSOCKETS = False
-MQTT_PORT = 8884 if USE_WEBSOCKETS else 1883
-MQTT_USERNAME = None
-MQTT_PASSWORD = None
-MQTT_TOPIC = "iot/ml/monitor/data"
-CLIENT_ID = None
+MQTT_PORT = 1883
+TOPIC_SENSOR = "iot/ml/monitor/data"
 
-# TLS root cert (optional if broker uses public CA; provided here for HiveMQ Cloud)
-ROOT_CA_CERT = """-----BEGIN CERTIFICATE-----
-MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
-... (trimmed in this snippet - keep full cert in your file) ...
------END CERTIFICATE-----"""
-
-# timezone helper
+# timezone GMT+7 helper
 TZ = timezone(timedelta(hours=7))
+def now_str():
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 # ---------------------------
-# Global queue & flags
+# module-level queue used by MQTT thread (do NOT replace this with st.session_state inside callbacks)
 # ---------------------------
 GLOBAL_MQ = queue.Queue()
-mqtt_thread_started_flag = "_mqtt_thread_started"
 
 # ---------------------------
-# Streamlit setup & session_state init (must be before starting worker)
+# Streamlit page setup
 # ---------------------------
-st.set_page_config(page_title="IoT Monitoring Dashboard", page_icon="🌡️", layout="wide")
-st.markdown("<h2>Temperature, Humidity, and Light Intensity Monitoring</h2>", unsafe_allow_html=True)
 
-# session state initial values (do this before worker starts)
-if "data" not in st.session_state:
-    st.session_state.data = []
-if "latest_data" not in st.session_state:
-    st.session_state.latest_data = {
-        "temperature": 0.0, "humidity": 0.0, "lightIntensity": 0, "lightCondition": "Terang",
-        "mlClassification": "normal", "timestamp": datetime.now(tz=TZ)
-    }
-if "last_status" not in st.session_state:
-    st.session_state.last_status = False
-if mqtt_thread_started_flag not in st.session_state:
-    st.session_state[mqtt_thread_started_flag] = False
+st.set_page_config(page_title="IoT ML Realtime Dashboard — Stable", layout="wide")
+st.title("🔥 IoT ML Realtime Dashboard — Stable")
 
 # ---------------------------
-# MQTT callbacks (must NOT touch st.session_state here)
+# session_state init (must be done before starting worker)
 # ---------------------------
-def _on_connect(client, userdata, flags, rc, properties=None):
+if "msg_queue" not in st.session_state:
+    # expose the global queue in session_state so UI can read it
+    st.session_state.msg_queue = GLOBAL_MQ
+
+if "logs" not in st.session_state:
+    st.session_state.logs = []         # list of dict rows
+
+if "last" not in st.session_state:
+    st.session_state.last = None
+
+if "mqtt_thread_started" not in st.session_state:
+    st.session_state.mqtt_thread_started = False
+
+if "ml_model" not in st.session_state:
+    st.session_state.ml_model = None
+
+# ---------------------------
+# Load Model (safe)
+# ---------------------------
+@st.cache_resource
+def load_ml_model(path):
     try:
-        client.subscribe(MQTT_TOPIC, qos=1)
+        m = joblib.load(path)
+        return m
+    except Exception as e:
+        # don't fail the app; just return None and show a warning in UI
+        st.warning(f"Could not load ML model from {path}: {e}")
+        return None
+
+if st.session_state.ml_model is None:
+    st.session_state.ml_model = load_ml_model(MODEL_PATH)
+if st.session_state.ml_model:
+    st.success(f"Model loaded: {MODEL_PATH}")
+else:
+    st.info("No ML model loaded. Upload iot_temp_model.pkl in repo to enable predictions.")
+
+# ---------------------------
+# MQTT callbacks (use GLOBAL_MQ, NOT st.session_state inside callbacks)
+# ---------------------------
+def _on_connect(client, userdata, flags, rc):
+    try:
+        client.subscribe(TOPIC_SENSOR)
     except Exception:
         pass
     # push connection status into queue
     GLOBAL_MQ.put({"_type": "status", "connected": (rc == 0), "ts": time.time()})
 
 def _on_message(client, userdata, msg):
+    payload = msg.payload.decode(errors="ignore")
     try:
-        payload = msg.payload.decode(errors="ignore")
         data = json.loads(payload)
-        # attach timestamp
-        data["timestamp"] = datetime.now(tz=TZ)
-        GLOBAL_MQ.put({"_type": "sensor", "data": data, "ts": time.time(), "topic": msg.topic})
-        print(f"📨 Received: T={data.get('temperature')}°C, H={data.get('humidity')}%")
-    except Exception as e:
-        # if not JSON, push raw
+    except Exception:
+        # push raw payload if JSON parse fails
         GLOBAL_MQ.put({"_type": "raw", "payload": payload, "ts": time.time()})
-        print(f"❌ MQTT on_message parse error: {e}")
+        return
 
-def _on_disconnect(client, userdata, rc, properties=None):
-    GLOBAL_MQ.put({"_type": "status", "connected": False, "ts": time.time()})
-    if rc != 0:
-        print(f"⚠️ Unexpected disconnect (rc={rc})")
+    # push structured sensor message
+    GLOBAL_MQ.put({"_type": "sensor", "data": data, "ts": time.time(), "topic": msg.topic})
 
 # ---------------------------
-# MQTT worker (runs in daemon thread exactly once)
+# Start MQTT thread (worker)
 # ---------------------------
-def mqtt_worker():
-    # create client with optional websocket transport
-    transport = "websockets" if USE_WEBSOCKETS else "tcp"
-    client = mqtt.Client(client_id=CLIENT_ID, transport=transport, protocol=mqtt.MQTTv5)
-
-    client.on_connect = _on_connect
-    client.on_message = _on_message
-    client.on_disconnect = _on_disconnect
-
-    # credentials
-    client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-
-    # TLS (if using TLS)
-    try:
-        cert_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.pem')
-        cert_file.write(ROOT_CA_CERT)
-        cert_file.close()
-        client.tls_set(ca_certs=cert_file.name, cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLSv1_2)
-    except Exception as e:
-        print(f"⚠️ TLS setup warning: {e}")
-
-    # connect loop with simple backoff
-    while True:
-        try:
-            client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-            client.loop_forever()  # blocks until disconnect or error
-        except Exception as e:
-            GLOBAL_MQ.put({"_type": "error", "msg": f"MQTT worker error: {e}", "ts": time.time()})
-            time.sleep(5)
-
 def start_mqtt_thread_once():
-    if not st.session_state.get(mqtt_thread_started_flag, False):
-        t = threading.Thread(target=mqtt_worker, daemon=True, name="mqtt_worker")
+    def worker():
+        client = mqtt.Client()
+        client.on_connect = _on_connect
+        client.on_message = _on_message
+        # optional: configure username/password if needed:
+        # client.username_pw_set(USER, PASS)
+        while True:
+            try:
+                client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+                client.loop_forever()
+            except Exception as e:
+                # push error into queue so UI can show it
+                GLOBAL_MQ.put({"_type": "error", "msg": f"MQTT worker error: {e}", "ts": time.time()})
+                time.sleep(5)  # backoff then retry
+
+    if not st.session_state.mqtt_thread_started:
+        t = threading.Thread(target=worker, daemon=True, name="mqtt_worker")
         t.start()
-        st.session_state[mqtt_thread_started_flag] = True
+        st.session_state.mqtt_thread_started = True
         time.sleep(0.05)
 
+# start thread
+start_mqtt_thread_once()
+
 # ---------------------------
-# Queue processing (drain GLOBAL_MQ into st.session_state safely)
+# Helper: model predict
 # ---------------------------
-def process_queue_once():
+def model_predict_label_and_conf(temp, hum):
+    model = st.session_state.ml_model
+    if model is None:
+        return ("N/A", None)
+    X = [[float(temp), float(hum)]]
+    try:
+        label = model.predict(X)[0]
+    except Exception:
+        label = "ERR"
+    prob = None
+    if hasattr(model, "predict_proba"):
+        try:
+            prob = float(np.max(model.predict_proba(X)))
+        except Exception:
+            prob = None
+    return (label, prob)
+
+# ---------------------------
+# Drain queue (process incoming msgs)
+# ---------------------------
+def process_queue():
     updated = False
-    q = GLOBAL_MQ
+    q = st.session_state.msg_queue
     while not q.empty():
         item = q.get()
         ttype = item.get("_type")
         if ttype == "status":
+            # status - connection
             st.session_state.last_status = item.get("connected", False)
             updated = True
         elif ttype == "error":
-            # log or display once
+            # show error
             st.error(item.get("msg"))
             updated = True
         elif ttype == "raw":
-            row = {"timestamp": datetime.now(tz=TZ), "raw": item.get("payload")}
-            st.session_state.data.append(row)
-            st.session_state.latest_data = row
+            row = {"ts": now_str(), "raw": item.get("payload")}
+            st.session_state.logs.append(row)
+            st.session_state.last = row
             updated = True
         elif ttype == "sensor":
             d = item.get("data", {})
-            # normalize keys used in your dashboard
+            try:
+                temp = float(d.get("temp"))
+            except Exception:
+                temp = None
+            try:
+                hum = float(d.get("hum"))
+            except Exception:
+                hum = None
+
             row = {
-                "timestamp": d.get("timestamp", datetime.now(tz=TZ)),
-                "temperature": float(d.get("temperature", 0.0)),
-                "humidity": float(d.get("humidity", 0.0)),
-                "lightIntensity": int(d.get("lightIntensity", 0)),
-                "lightCondition": d.get("lightCondition", "Terang"),
-                "mlClassification": d.get("mlClassification", "normal")
+                "ts": datetime.fromtimestamp(item.get("ts", time.time()), TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                "temp": temp,
+                "hum": hum
             }
-            st.session_state.latest_data = row
-            st.session_state.data.append(row)
-            # bound the stored data
-            if len(st.session_state.data) > 1000:
-                st.session_state.data = st.session_state.data[-1000:]
+
+            # ML prediction
+            if temp is not None and hum is not None:
+                label, conf = model_predict_label_and_conf(temp, hum)
+            else:
+                label, conf = ("N/A", None)
+
+            row["pred"] = label
+            row["conf"] = conf
+
+            # simple anomaly: low confidence or z-score on latest window
+            anomaly = False
+            if conf is not None and conf < 0.6:
+                anomaly = True
+
+            # z-score on temp using recent window
+            temps = [r["temp"] for r in st.session_state.logs if r.get("temp") is not None]
+            window = temps[-30:] if len(temps) > 0 else []
+            if len(window) >= 5 and temp is not None:
+                mean = float(np.mean(window))
+                std = float(np.std(window, ddof=0))
+                if std > 0:
+                    z = abs((temp - mean) / std)
+                    if z >= 3.0:
+                        anomaly = True
+
+            row["anomaly"] = anomaly
+            st.session_state.last = row
+            st.session_state.logs.append(row)
+            # keep bounded
+            if len(st.session_state.logs) > 5000:
+                st.session_state.logs = st.session_state.logs[-5000:]
             updated = True
+
+            # Auto-publish alert back to ESP32 (fire-and-forget client)
+            try:
+                if label == "Panas":
+                    pubc = mqtt.Client()
+                    pubc.connect(MQTT_BROKER, MQTT_PORT, 60)
+                    pubc.publish(TOPIC_OUTPUT, "ALERT_ON")
+                    pubc.disconnect()
+                else:
+                    pubc = mqtt.Client()
+                    pubc.connect(MQTT_BROKER, MQTT_PORT, 60)
+                    pubc.publish(TOPIC_OUTPUT, "ALERT_OFF")
+                    pubc.disconnect()
+            except Exception:
+                pass
     return updated
 
-# ---------------------------
-# Start the MQTT thread AFTER session_state has been initialized
-# ---------------------------
-start_mqtt_thread_once()
+# run once here to pick up immediately available messages
+_ = process_queue()
 
 # ---------------------------
-# UI: process queue, then render
+# UI layout
 # ---------------------------
-_ = process_queue_once()
+# optionally auto refresh UI; requires streamlit-autorefresh in requirements
+if HAS_AUTOREFRESH:
+    st_autorefresh(interval=2000, limit=None, key="autorefresh")  # 2s refresh
 
-# Optional auto-refresh: use streamlit_autorefresh if installed, otherwise rely on manual refresh
-try:
-    from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=3000, key="autorefresh")  # every 3s
-except Exception:
-    pass
+left, right = st.columns([1, 2])
 
-# Header & status
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.write("Broker:", f"{MQTT_BROKER}:{MQTT_PORT} (ws)" if USE_WEBSOCKETS else "")
-    st.metric("MQTT Connected", "Yes" if st.session_state.last_status else "No")
-with col2:
-    st.metric("Data Points", len(st.session_state.data))
-with col3:
-    if st.session_state.data:
-        last_ts = st.session_state.latest_data.get("timestamp", datetime.now(tz=TZ))
-        elapsed = int((datetime.now(tz=TZ) - last_ts).total_seconds())
-        st.metric("Last update", f"{elapsed}s ago")
+with left:
+    st.header("Connection Status")
+    st.write("Broker:", f"{MQTT_BROKER}:{MQTT_PORT}")
+    connected = getattr(st.session_state, "last_status", None)
+    st.metric("MQTT Connected", "Yes" if connected else "No")
+    st.write("Topic:", TOPIC_SENSOR)
+    st.markdown("---")
+
+    st.header("Last Reading")
+    if st.session_state.last:
+        last = st.session_state.last
+        st.write(f"Time: {last.get('ts')}")
+        st.write(f"Temp: {last.get('temp')} °C")
+        st.write(f"Hum : {last.get('hum')} %")
+        st.write(f"Prediction: {last.get('pred')}")
+        st.write(f"Confidence: {last.get('conf')}")
+        st.write(f"Anomaly flag: {last.get('anomaly')}")
     else:
         st.info("Waiting for data...")
 
-st.markdown("---")
+    st.markdown("---")
+    st.header("Manual Output Control")
+    col1, col2 = st.columns(2)
+    if col1.button("Send ALERT_ON"):
+        try:
+            pubc = mqtt.Client()
+            pubc.connect(MQTT_BROKER, MQTT_PORT, 60)
+            pubc.publish(TOPIC_OUTPUT, "ALERT_ON")
+            pubc.disconnect()
+            st.success("Published ALERT_ON")
+        except Exception as e:
+            st.error(f"Publish failed: {e}")
+    if col2.button("Send ALERT_OFF"):
+        try:
+            pubc = mqtt.Client()
+            pubc.connect(MQTT_BROKER, MQTT_PORT, 60)
+            pubc.publish(TOPIC_OUTPUT, "ALERT_OFF")
+            pubc.disconnect()
+            st.success("Published ALERT_OFF")
+        except Exception as e:
+            st.error(f"Publish failed: {e}")
 
-# Charts
-left, right = st.columns(2)
-latest = st.session_state.latest_data
-
-with left:
-    st.subheader("Temperature")
-    if st.session_state.data:
-        df = pd.DataFrame(st.session_state.data)
-        fig_temp = go.Figure()
-        fig_temp.add_trace(go.Scatter(x=df['timestamp'], y=df['temperature'], mode='lines+markers', name='Temperature'))
-        fig_temp.update_layout(height=350, template='plotly_dark')
-        st.plotly_chart(fig_temp, use_container_width=True)
-        st.metric("Current Temperature", f"{latest['temperature']:.1f}°C")
-    else:
-        st.info("Waiting for temperature data...")
-        st.metric("Current Temperature", "0.0°C")
+    st.markdown("---")
+    st.header("Download Logs")
+    if st.button("Download CSV"):
+        if st.session_state.logs:
+            df_dl = pd.DataFrame(st.session_state.logs)
+            csv = df_dl.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV file", data=csv, file_name=f"iot_logs_{int(time.time())}.csv")
+        else:
+            st.info("No logs to download")
 
 with right:
-    st.subheader("Humidity")
-    if st.session_state.data:
-        df = pd.DataFrame(st.session_state.data)
-        fig_hum = go.Figure()
-        fig_hum.add_trace(go.Scatter(x=df['timestamp'], y=df['humidity'], mode='lines+markers', name='Humidity'))
-        fig_hum.update_layout(height=350, template='plotly_dark')
-        st.plotly_chart(fig_hum, use_container_width=True)
-        st.metric("Current Humidity", f"{latest['humidity']:.1f}%")
+    st.header("Live Chart (last 200 points)")
+    df_plot = pd.DataFrame(st.session_state.logs[-200:])
+    if (not df_plot.empty) and {"temp", "hum"}.issubset(df_plot.columns):
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df_plot["ts"], y=df_plot["temp"], mode="lines+markers", name="Temp (°C)"))
+        fig.add_trace(go.Scatter(x=df_plot["ts"], y=df_plot["hum"], mode="lines+markers", name="Hum (%)", yaxis="y2"))
+        fig.update_layout(
+            yaxis=dict(title="Temp (°C)"),
+            yaxis2=dict(title="Humidity (%)", overlaying="y", side="right", showgrid=False),
+            height=520
+        )
+        # color markers by anomaly / label
+        colors = []
+        for _, r in df_plot.iterrows():
+            if r.get("anomaly"):
+                colors.append("magenta")
+            else:
+                lab = r.get("pred", "")
+                if lab == "Panas":
+                    colors.append("red")
+                elif lab == "Normal":
+                    colors.append("green")
+                elif lab == "Dingin":
+                    colors.append("blue")
+                else:
+                    colors.append("gray")
+        fig.update_traces(marker=dict(size=8, color=colors), selector=dict(mode="lines+markers"))
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Waiting for humidity data...")
-        st.metric("Current Humidity", "0.0%")
+        st.info("No data yet. Make sure ESP32 publishes to correct topic.")
 
-st.markdown("---")
-st.subheader("Light")
-if latest:
-    if latest.get("lightCondition", "Terang") == "Gelap":
-        st.write("Kondisi: GELAP")
+    st.markdown("### Recent Logs")
+    if st.session_state.logs:
+        st.dataframe(pd.DataFrame(st.session_state.logs)[::-1].head(100))
     else:
-        st.write("Kondisi: TERANG")
-    st.write("Intensity:", latest.get("lightIntensity", 0))
+        st.write("—")
 
-st.markdown("---")
-st.subheader("Download data")
-if st.session_state.data:
-    df_dl = pd.DataFrame(st.session_state.data)
-    df_dl['timestamp'] = pd.to_datetime(df_dl['timestamp']).dt.strftime("%Y-%m-%d %H:%M:%S")
-    csv = df_dl.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", data=csv, file_name=f"iot_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-else:
-    st.info("No data to download")
+# after UI render, drain queue (so next rerun shows fresh data)
+process_queue()
 
-# drain queue again at end of render to pick up any messages arrived during render
-process_queue_once()
