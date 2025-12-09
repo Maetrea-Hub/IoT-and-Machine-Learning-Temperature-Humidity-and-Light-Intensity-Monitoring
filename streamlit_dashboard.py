@@ -15,14 +15,14 @@ import queue
 # ---------------------------
 # Config (edit as needed)
 # ---------------------------
-MQTT_BROKER = "ac2c24cb9a454ce58c90f3f25913b733.s1.eu.hivemq.cloud"
+MQTT_BROKER = "broker.hivemq.com"
 # If using WebSocket (recommended for Streamlit Cloud), set USE_WEBSOCKETS = True and MQTT_PORT accordingly (8884 for HiveMQ WSS)
 USE_WEBSOCKETS = False
-MQTT_PORT = 8884 if USE_WEBSOCKETS else 8883
-MQTT_USERNAME = "esp32_client"
-MQTT_PASSWORD = "KensellMHA245n10"
+MQTT_PORT = 8884 if USE_WEBSOCKETS else 1883
+MQTT_USERNAME = None
+MQTT_PASSWORD = None
 MQTT_TOPIC = "iot/ml/monitor/data"
-CLIENT_ID = f"Streamlit_Dashboard_{random.randint(1000,9999)}"
+CLIENT_ID = None
 
 # TLS root cert (optional if broker uses public CA; provided here for HiveMQ Cloud)
 ROOT_CA_CERT = """-----BEGIN CERTIFICATE-----
