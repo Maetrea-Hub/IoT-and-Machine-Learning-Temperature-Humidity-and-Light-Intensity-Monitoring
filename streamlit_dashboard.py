@@ -15,9 +15,8 @@ import queue
 # ---------------------------
 # Config (edit as needed)
 # ---------------------------
-MQTT_BROKER = "ac2c24cb9a454ce58c90f3f25913b733.s1.eu.hivemq.cloud:8884/mqtt"
-USE_WEBSOCKETS = True
-MQTT_PORT = 8884
+MQTT_BROKER = "ac2c24cb9a454ce58c90f3f25913b733.s1.eu.hivemq.cloud"
+MQTT_PORT = 8883
 MQTT_USERNAME = "esp32_client"
 MQTT_PASSWORD = "KensellMHA245n10"
 MQTT_TOPIC = "iot/ml/monitor/data"
